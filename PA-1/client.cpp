@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <iomanip>
 
 using namespace std;
 
@@ -144,21 +145,34 @@ int main (int argc, char *argv[]) {
     // Case 1: single datapoint
     if (p != -1 && t >= 0 && (e == 1 || e == 2)) {
         double val = request_ecg(*chan, p, t, e);
-        cout << "For person " << p << ", at time " << t
-             << ", ECG" << e << " is " << val << endl;
+        cout << "For person " << p
+        << ", at time " << fixed << setprecision(3) << t
+        << ", the value of ecg " << e
+        << " is " << fixed << setprecision(2) << val << endl;
+
     }
     // Case 2: first 1000 data points
     else if (p != -1 && t < 0 && e == -1 && filename == "") {
-        ofstream fout("x1.csv");
-        fout << "time,ecg1,ecg2\n";
+        system("mkdir -p received");   // ensure folder exists
+        ofstream fout("received/x1.csv");
         for (int i = 0; i < 1000; i++) {
             double timepoint = i * 0.004;
-            double ecg1 = request_ecg(*chan, p, timepoint, 1);
-            double ecg2 = request_ecg(*chan, p, timepoint, 2);
-            fout << timepoint << "," << ecg1 << "," << ecg2 << "\n";
+
+            datamsg d1(p, timepoint, 1);
+            chan->cwrite(&d1, sizeof(datamsg));
+            double ecg1; chan->cread(&ecg1, sizeof(double));
+
+            datamsg d2(p, timepoint, 2);
+            chan->cwrite(&d2, sizeof(datamsg));
+            double ecg2; chan->cread(&ecg2, sizeof(double));
+
+            // same formatting as BIMDC CSV
+            fout << setprecision(6) << timepoint << ","
+            << setprecision(6) << ecg1 << ","
+            << ecg2 << "\n";
         }
         fout.close();
-        cout << "First 1000 points written to x1.csv\n";
+        cout << "First 1000 points written to received/x1.csv\n";
     }
     // Case 3: file transfer
     else if (!filename.empty()) {
