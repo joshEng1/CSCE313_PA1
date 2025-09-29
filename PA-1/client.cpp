@@ -6,65 +6,177 @@
     Date: 2/8/20
 	
 	Please include your Name, UIN, and the date below
-	Name:
-	UIN:
-	Date:
+	Name: Joshua Eng
+	UIN: 334000592
+	Date: 9/28/2025
 */
+
 #include "common.h"
 #include "FIFORequestChannel.h"
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cstring>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 using namespace std;
 
+double request_ecg(FIFORequestChannel& chan, int p, double t, int e) {
+    datamsg d(p, t, e);
+    chan.cwrite(&d, sizeof(d));
+    double val;
+    chan.cread(&val, sizeof(double));
+    return val;
+}
+
+__int64_t request_file_size(FIFORequestChannel& chan, const string& fname) {
+    filemsg fm(0, 0);
+    int len = sizeof(filemsg) + fname.size() + 1;
+    vector<char> buf(len);
+    memcpy(buf.data(), &fm, sizeof(filemsg));
+    strcpy(buf.data() + sizeof(filemsg), fname.c_str());
+
+    chan.cwrite(buf.data(), len);
+    __int64_t filesize;
+    chan.cread(&filesize, sizeof(filesize));
+    return filesize;
+}
+
+void request_file(FIFORequestChannel& chan, const string& fname, int buffercap) {
+    __int64_t filesize = request_file_size(chan, fname);
+
+    system("mkdir -p received");
+    string outpath = "received/" + fname;
+    FILE* out = fopen(outpath.c_str(), "wb");
+    if (!out) { perror("fopen"); return; }
+
+    __int64_t offset = 0;
+    while (offset < filesize) {
+        int chunk = min((__int64_t)buffercap, filesize - offset);
+        filemsg fm(offset, chunk);
+
+        int len = sizeof(filemsg) + fname.size() + 1;
+        vector<char> buf(len);
+        memcpy(buf.data(), &fm, sizeof(filemsg));
+        strcpy(buf.data() + sizeof(filemsg), fname.c_str());
+
+        chan.cwrite(buf.data(), len);
+
+        vector<char> recvbuf(chunk);
+        chan.cread(recvbuf.data(), chunk);
+        fwrite(recvbuf.data(), 1, chunk, out);
+
+        offset += chunk;
+    }
+    fclose(out);
+    cout << "File saved to " << outpath << " (" << filesize << " bytes)" << endl;
+}
 
 int main (int argc, char *argv[]) {
 	int opt;
-	int p = 1;
-	double t = 0.0;
-	int e = 1;
-	
+	int p = -1;
+	double t = -1.0;
+	int e = -1;
 	string filename = "";
-	while ((opt = getopt(argc, argv, "p:t:e:f:")) != -1) {
+    int buffercap = MAX_MESSAGE;
+    bool newchan = false;
+
+	while ((opt = getopt(argc, argv, "p:t:e:f:m:c")) != -1) {
 		switch (opt) {
-			case 'p':
-				p = atoi (optarg);
-				break;
-			case 't':
-				t = atof (optarg);
-				break;
-			case 'e':
-				e = atoi (optarg);
-				break;
-			case 'f':
-				filename = optarg;
-				break;
+			case 'p': 
+                p = atoi(optarg); 
+                break;
+			case 't': 
+                t = atof(optarg);
+                break;
+			case 'e': 
+                e = atoi(optarg);
+                break;
+			case 'f': 
+                filename = optarg; 
+                break;
+            case 'm': 
+                buffercap = atoi(optarg); 
+                break;
+            case 'c': 
+                newchan = true; 
+                break;
 		}
 	}
 
-    FIFORequestChannel chan("control", FIFORequestChannel::CLIENT_SIDE);
-	
-	// example data point request
-    char buf[MAX_MESSAGE]; // 256
-    datamsg x(1, 0.0, 1);
-	
-	memcpy(buf, &x, sizeof(datamsg));
-	chan.cwrite(buf, sizeof(datamsg)); // question
-	double reply;
-	chan.cread(&reply, sizeof(double)); //answer
-	cout << "For person " << p << ", at time " << t << ", the value of ecg " << e << " is " << reply << endl;
-	
-    // sending a non-sense message, you need to change this
-	filemsg fm(0, 0);
-	string fname = "teslkansdlkjflasjdf.dat";
-	
-	int len = sizeof(filemsg) + (fname.size() + 1);
-	char* buf2 = new char[len];
-	memcpy(buf2, &fm, sizeof(filemsg));
-	strcpy(buf2 + sizeof(filemsg), fname.c_str());
-	chan.cwrite(buf2, len);  // I want the file length;
+    // 🔹 Fork and exec the server
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child process: run server
+        if (buffercap != MAX_MESSAGE) {
+            string mopt = to_string(buffercap);
+            execl("./server", "server", "-m", mopt.c_str(), (char*)NULL);
+        } else {
+            execl("./server", "server", (char*)NULL);
+        }
+        perror("execl failed");
+        _exit(1);
+    }
 
-	delete[] buf2;
-	
-	// closing the channel    
-    MESSAGE_TYPE m = QUIT_MSG;
-    chan.cwrite(&m, sizeof(MESSAGE_TYPE));
+    // Parent (client) continues
+    usleep(100000); // give server time to set up FIFOs
+
+    // Create control channel
+    FIFORequestChannel control("control", FIFORequestChannel::CLIENT_SIDE);
+    FIFORequestChannel* chan = &control;
+
+    // Optional new channel
+    FIFORequestChannel* extra = nullptr;
+    if (newchan) {
+        MESSAGE_TYPE m = NEWCHANNEL_MSG;
+        control.cwrite(&m, sizeof(m));
+
+        char name[256];
+        control.cread(name, sizeof(name));
+        extra = new FIFORequestChannel(name, FIFORequestChannel::CLIENT_SIDE);
+        chan = extra;
+    }
+
+    // Case 1: single datapoint
+    if (p != -1 && t >= 0 && (e == 1 || e == 2)) {
+        double val = request_ecg(*chan, p, t, e);
+        cout << "For person " << p << ", at time " << t
+             << ", ECG" << e << " is " << val << endl;
+    }
+    // Case 2: first 1000 data points
+    else if (p != -1 && t < 0 && e == -1 && filename == "") {
+        ofstream fout("x1.csv");
+        fout << "time,ecg1,ecg2\n";
+        for (int i = 0; i < 1000; i++) {
+            double timepoint = i * 0.004;
+            double ecg1 = request_ecg(*chan, p, timepoint, 1);
+            double ecg2 = request_ecg(*chan, p, timepoint, 2);
+            fout << timepoint << "," << ecg1 << "," << ecg2 << "\n";
+        }
+        fout.close();
+        cout << "First 1000 points written to x1.csv\n";
+    }
+    // Case 3: file transfer
+    else if (!filename.empty()) {
+        request_file(*chan, filename, buffercap);
+    }
+
+    // Cleanup channels
+    if (extra) {
+        MESSAGE_TYPE q = QUIT_MSG;
+        extra->cwrite(&q, sizeof(q));
+        delete extra;
+    }
+    MESSAGE_TYPE q = QUIT_MSG;
+    control.cwrite(&q, sizeof(q));
+
+    // 🔹 Wait for the server to terminate
+    int status;
+    waitpid(pid, &status, 0);
+
+    return 0;
 }
