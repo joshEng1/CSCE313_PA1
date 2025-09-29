@@ -1,0 +1,1 @@
+The transfer time increases roughly linearly with file size, which makes sense since the file is sent in fixed-size chunks and each chunk requires a separate operation. The main bottleneck is the overhead of system calls and context switches in named pipe communication, not the actual disk or memory speed.
